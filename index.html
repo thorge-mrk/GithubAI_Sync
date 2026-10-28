@@ -1,1190 +1,204 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, addDoc, onSnapshot, doc, deleteDoc, setDoc, updateDoc, enableIndexedDbPersistence } from 'firebase/firestore';
-
-// --- Globale Konstanten ---
-const apiKey = ""; // Fallback API Key (wird durch User-Key überschrieben)
-
-// Systemdateien, die niemals gelöscht werden dürfen
-const PROTECTED_FILES_REGEX = /^(?:\.gitignore|\.env.*|firebase\.json|vercel\.json|netlify\.toml|package-lock\.json|yarn\.lock|\.github\/.*|node_modules\/.*|build\/.*|dist\/.*)$/i;
-
-// Firebase Setup & Offline Persistenz
-let app, auth, db, appId;
-try {
-  const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-  appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-  
-  // Aktiviere Offline-Speicherung für die Datenbank
-  try {
-    enableIndexedDbPersistence(db).catch((err) => {
-      console.warn("Offline Speicherung konnte nicht aktiviert werden:", err.code);
-    });
-  } catch(e) {}
-} catch (e) {
-  console.error("Firebase Init Fehler:", e);
-}
-
-export default function App() {
-  const [user, setUser] = useState(null);
-  const [globalSettings, setGlobalSettings] = useState(null);
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
-  const [isGlobalSettingsModalOpen, setIsGlobalSettingsModalOpen] = useState(false);
-  const [tokenStatus, setTokenStatus] = useState(null); 
-
-  const [dialog, setDialog] = useState(null); 
-
-  const [projects, setProjects] = useState([]);
-  const [history, setHistory] = useState([]);
-  const [view, setView] = useState('loading'); // 'loading', 'landing', 'setup', 'dashboard', 'new_project', 'project_detail', 'sync_flow'
-  const [activeProject, setActiveProject] = useState(null);
-  const [isProjectSettingsModalOpen, setIsProjectSettingsModalOpen] = useState(false);
-
-  // Setup Flow State
-  const [setupStep, setSetupStep] = useState(1); 
-  const [tempGithubToken, setTempGithubToken] = useState('');
-  const [tempGeminiToken, setTempGeminiToken] = useState('');
-  const [setupError, setSetupError] = useState('');
-  const [isVerifying, setIsVerifying] = useState(false);
-
-  const [newProjectForm, setNewProjectForm] = useState({ name: '', repoStr: '', branch: '' });
-  const [isSavingProject, setIsSavingProject] = useState(false);
-  const [availableRepos, setAvailableRepos] = useState([]);
-  const [availableBranches, setAvailableBranches] = useState([]);
-  const [isLoadingRepos, setIsLoadingRepos] = useState(false);
-  const [isLoadingBranches, setIsLoadingBranches] = useState(false);
-
-  const [stagedFiles, setStagedFiles] = useState([]);
-  const [isFullSync, setIsFullSync] = useState(false); 
-
-  // Sync State
-  const [syncStep, setSyncStep] = useState('analysis'); 
-  const [analysisResult, setAnalysisResult] = useState(null);
-  const [aiCommitMessage, setAiCommitMessage] = useState('');
-  const [deletableFiles, setDeletableFiles] = useState([]); 
-  
-  const [logs, setLogs] = useState([]);
-  const [progress, setProgress] = useState({ current: 0, total: 0 });
-  const logsEndRef = useRef(null);
-
-  useEffect(() => {
-    if (!auth) return;
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (err) { console.error("Auth Error:", err); }
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    if (!user || !db) return;
-
-    const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config');
-    const unsubSettings = onSnapshot(settingsRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        setGlobalSettings(data);
-        if (data.githubToken && data.geminiToken) {
-          setView(v => (v === 'loading' || v === 'setup') ? 'dashboard' : v);
-          checkTokenValidity(data.githubToken);
-        } else {
-          if (data.githubToken) setTempGithubToken(data.githubToken);
-          setView(v => v === 'loading' ? 'landing' : v);
-        }
-      } else {
-        setGlobalSettings({ githubToken: '', geminiToken: '' });
-        setView(v => v === 'loading' ? 'landing' : v);
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitHub AI Sync – Offline (No Build)</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b1020;
+        --card: #151d34;
+        --muted: #95a0c2;
+        --text: #f2f5ff;
+        --accent: #6ea8fe;
+        --danger: #ff6b6b;
       }
-      setSettingsLoaded(true);
-    });
-
-    const projectsRef = collection(db, 'artifacts', appId, 'users', user.uid, 'projects');
-    const unsubP = onSnapshot(projectsRef, (snap) => {
-      const p = []; snap.forEach(d => p.push({ id: d.id, ...d.data() }));
-      setProjects(p.sort((a, b) => b.createdAt - a.createdAt));
-    });
-
-    const historyRef = collection(db, 'artifacts', appId, 'users', user.uid, 'history');
-    const unsubH = onSnapshot(historyRef, (snap) => {
-      const h = []; snap.forEach(d => h.push({ id: d.id, ...d.data() }));
-      setHistory(h.sort((a, b) => b.timestamp - a.timestamp));
-    });
-
-    return () => { unsubSettings(); unsubP(); unsubH(); };
-  }, [user]);
-
-  useEffect(() => {
-    if (!window.JSZip) {
-      const script = document.createElement('script');
-      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
-      script.async = true;
-      document.body.appendChild(script);
-    }
-  }, []);
-
-  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
-
-  const addLog = (msg, type = 'info') => setLogs(prev => [...prev, { time: new Date().toLocaleTimeString(), msg, type }]);
-
-  // --- Setup Flow Validierung ---
-  const handleCheckGithub = async () => {
-    setIsVerifying(true);
-    setSetupError('');
-    try {
-      const res = await fetch('https://api.github.com/user', {
-        headers: { 'Authorization': `token ${tempGithubToken}`, 'Accept': 'application/vnd.github.v3+json' }
-      });
-      if (res.ok) {
-         setSetupStep(2);
-      } else {
-         setTempGithubToken(''); // Feld leeren bei Fehler
-         setSetupError('Dieser Token ist ungültig oder abgelaufen. Bitte versuche es erneut.');
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Inter, system-ui, Arial, sans-serif;
+        background: radial-gradient(circle at top, #16203f, var(--bg));
+        color: var(--text);
       }
-    } catch {
-      setTempGithubToken('');
-      setSetupError('Verbindungsfehler zu GitHub. Blockiert dein Browser die Anfrage oder hast du dich vertippt?');
-    }
-    setIsVerifying(false);
-  };
-
-  const handleCheckGemini = async () => {
-    setIsVerifying(true);
-    setSetupError('');
-    try {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${tempGeminiToken}`);
-      if (res.ok) {
-         await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), { 
-            githubToken: tempGithubToken,
-            geminiToken: tempGeminiToken
-         }, { merge: true });
-         setView('dashboard');
-      } else {
-         setTempGeminiToken('');
-         setSetupError('Google AI Studio Key ist ungültig. Bitte überprüfe den Key.');
+      .wrap { max-width: 980px; margin: 0 auto; padding: 24px; }
+      .card {
+        background: linear-gradient(180deg, #1a2445, var(--card));
+        border: 1px solid #2a3560;
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
       }
-    } catch {
-      setTempGeminiToken('');
-      setSetupError('Verbindungsfehler zu Google AI Studio. Bitte prüfe deine Internetverbindung.');
-    }
-    setIsVerifying(false);
-  };
+      h1, h2, h3 { margin-top: 0; }
+      .muted { color: var(--muted); }
+      .grid { display: grid; gap: 12px; }
+      .g2 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+      input, textarea, select, button {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #314173;
+        background: #111935;
+        color: var(--text);
+        padding: 10px;
+      }
+      button {
+        cursor: pointer;
+        background: linear-gradient(180deg, #2e4f9f, #244184);
+        border-color: #4566bb;
+      }
+      button.secondary { background: #1a254b; }
+      button.danger { background: #5e2020; border-color: #8b3232; }
+      ul { list-style: none; padding-left: 0; margin: 0; }
+      li { padding: 10px; border: 1px solid #2a3560; border-radius: 8px; margin-bottom: 8px; }
+      .row { display: flex; gap: 8px; align-items: center; }
+      .row > * { flex: 1; }
+      .small { font-size: 12px; }
+      .tag { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #22315f; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
 
-  const checkTokenValidity = async (token) => {
-    setTokenStatus('loading');
-    try {
-      const res = await fetch('https://api.github.com/user', {
-        headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' }
-      });
-      setTokenStatus(res.ok ? 'valid' : 'invalid');
-    } catch {
-      setTokenStatus('invalid');
-    }
-  };
+    <!-- React + Babel im Browser: keine Build-Pipeline nötig -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  const handleSaveGlobalTokens = async () => {
-    const gh = document.getElementById('globalTokenInput').value;
-    const gem = document.getElementById('globalGeminiInput').value;
-    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'config'), { 
-      githubToken: gh,
-      geminiToken: gem
-    }, { merge: true });
-    setIsGlobalSettingsModalOpen(false);
-  };
+    <script type="text/babel">
+      const STORAGE_KEY = "github-ai-sync-offline-v1";
 
-  useEffect(() => {
-    if (!globalSettings?.githubToken || view !== 'new_project') return;
-    const fetchRepos = async () => {
-      setIsLoadingRepos(true);
-      try {
-        const res = await fetch('https://api.github.com/user/repos?per_page=100&sort=updated', {
-          headers: { 'Authorization': `token ${globalSettings.githubToken}`, 'Accept': 'application/vnd.github.v3+json' }
-        });
-        if (res.ok) setAvailableRepos((await res.json()).map(r => r.full_name));
-      } catch (e) { console.error(e); }
-      setIsLoadingRepos(false);
-    };
-    fetchRepos();
-  }, [globalSettings?.githubToken, view]);
+      const initialState = {
+        settings: { githubToken: "", geminiToken: "" },
+        projects: [],
+        history: []
+      };
 
-  useEffect(() => {
-    if (!globalSettings?.githubToken || !newProjectForm.repoStr) {
-      setAvailableBranches([]); return;
-    }
-    const fetchBranches = async () => {
-      setIsLoadingBranches(true);
-      try {
-        const res = await fetch(`https://api.github.com/repos/${newProjectForm.repoStr}/branches`, {
-          headers: { 'Authorization': `token ${globalSettings.githubToken}`, 'Accept': 'application/vnd.github.v3+json' }
-        });
-        if (res.ok) {
-          const branchNames = (await res.json()).map(b => b.name);
-          setAvailableBranches(branchNames);
-          if (!newProjectForm.branch) {
-            const defaultBranch = branchNames.find(b => b === 'main' || b === 'master') || branchNames[0];
-            if (defaultBranch) setNewProjectForm(prev => ({ ...prev, branch: defaultBranch }));
-          }
-        }
-      } catch (e) { console.error(e); }
-      setIsLoadingBranches(false);
-    };
-    fetchBranches();
-  }, [newProjectForm.repoStr, globalSettings?.githubToken]);
-
-  const handleCreateProject = async () => {
-    if (!newProjectForm.name || !newProjectForm.repoStr || !newProjectForm.branch || isSavingProject) return;
-    setIsSavingProject(true);
-    try {
-      await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'projects'), { 
-        ...newProjectForm, 
-        isAutoCommit: false,
-        createdAt: Date.now() 
-      });
-      setNewProjectForm({ name: '', repoStr: '', branch: '' });
-      setAvailableBranches([]);
-      setView('dashboard');
-    } catch (error) {
-      setDialog({ message: "Fehler beim Erstellen des Projekts.", isAlert: true });
-    } finally {
-      setIsSavingProject(false);
-    }
-  };
-
-  const handleToggleAutoCommit = (e) => {
-    const isChecked = e.target.checked;
-    if (isChecked) {
-      setDialog({
-        message: "Achtung: Wenn Auto-Commit aktiviert ist, wird beim Klick auf Synchronisieren keine Vorschau mehr angezeigt. Der Code geht direkt live. (Unsichere Dateien werden automatisch behalten). Möchtest du das aktivieren?",
-        onConfirm: async () => {
-          await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'projects', activeProject.id), { isAutoCommit: true });
-          setActiveProject(prev => ({...prev, isAutoCommit: true}));
-        }
-      });
-    } else {
-      updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'projects', activeProject.id), { isAutoCommit: false });
-      setActiveProject(prev => ({...prev, isAutoCommit: false}));
-    }
-  };
-
-  const handleDeleteProject = () => {
-    setDialog({
-      message: "Möchtest du dieses Projekt wirklich aus deinem Dashboard löschen? Der Code auf GitHub bleibt erhalten, aber der Sync-Verlauf hier wird gelöscht.",
-      isDestructive: true,
-      onConfirm: async () => {
+      function loadState() {
         try {
-          await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'projects', activeProject.id));
-          setIsProjectSettingsModalOpen(false);
-          setView('dashboard');
-        } catch (error) {
-          setDialog({ message: "Fehler beim Löschen.", isAlert: true });
-        }
-      }
-    });
-  };
-
-  const handleFileSelect = (e) => {
-    const files = Array.from(e.target.files);
-    setStagedFiles(prev => {
-      const updated = [...prev, ...files];
-      if (updated.some(f => f.name.toLowerCase().endsWith('.zip'))) {
-        setIsFullSync(true);
-      }
-      return updated;
-    });
-    e.target.value = null; 
-  };
-
-  const removeStagedFile = (idx) => {
-    setStagedFiles(prev => {
-      const updated = prev.filter((_, i) => i !== idx);
-      if (!updated.some(f => f.name.toLowerCase().endsWith('.zip'))) {
-        setIsFullSync(false);
-      }
-      return updated;
-    });
-  };
-
-  const saveHistoryEntry = async (projectId, message, stats, sha) => {
-    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'history'), { projectId, timestamp: Date.now(), message, stats, commitSha: sha });
-  };
-
-  const githubRequest = async (repoStr, endpoint, method = 'GET', body = null) => {
-    const res = await fetch(`https://api.github.com/repos/${repoStr}${endpoint}`, {
-      method,
-      headers: { 'Authorization': `token ${globalSettings.githubToken}`, 'Accept': 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : null
-    });
-    if (!res.ok) throw new Error(await res.text());
-    return res.json();
-  };
-
-  const calculateGitBlobSha = async (uint8array) => {
-    const prefix = new TextEncoder().encode(`blob ${uint8array.length}\0`);
-    const combined = new Uint8Array(prefix.length + uint8array.length);
-    combined.set(prefix); combined.set(uint8array, prefix.length);
-    const hashBuffer = await crypto.subtle.digest('SHA-1', combined);
-    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-  };
-
-  const b64DecodeUnicode = (str) => decodeURIComponent(atob(str).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-
-  const arrayBufferToBase64 = (buffer) => {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return window.btoa(binary);
-  };
-
-  // --- KI Funktionen (Nutzt jetzt deinen Google AI Studio Key) ---
-  const getActualGeminiKey = () => globalSettings?.geminiToken || apiKey;
-
-  const analyzeDeletionsBatchWithAI = async (paths, projectContext) => {
-    try {
-      const prompt = `Du bist ein tiefgründiger und extrem vorsichtiger Senior-Code-Reviewer.
-      Dateien, die im neuen Upload fehlen (potenziell gelöscht): ${JSON.stringify(paths)}
-      
-      KONTEXT (Neue/Geänderte Dateien in diesem Upload):
-      ${projectContext}
-      
-      AUFGABE: Überprüfe tiefgründig, ob die fehlenden Dateien noch gebraucht werden (z.B. ob sie in den neuen Dateien importiert werden oder wichtige Assets sind).
-      Bewerte jede fehlende Datei mit genau einem dieser 3 Status:
-      1. "keep" -> Sicher behalten (Wird im Kontext noch referenziert, ist ein wichtiges Asset/Config, oder du bist einfach unsicher).
-      2. "unsure" -> Unsicher löschen (Scheint veraltet/unbenutzt, aber es gibt keinen 100% klaren Beweis).
-      3. "delete" -> Sicher löschen (Offensichtlich durch neuen Code ersetzt, altes Test-Artefakt oder unbenutzt).
-      
-      Antworte STRIKT als reines JSON (kein Markdown!):
-      {
-        "deletions": [
-          { "path": "datei_name", "status": "keep" | "unsure" | "delete", "reason": "Kurzer Grund, wozu die Datei genutzt wurde und deine Entscheidung" }
-        ]
-      }`;
-
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${getActualGeminiKey()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      });
-      const data = await response.json();
-      let rawText = data.candidates[0].content.parts[0].text;
-      rawText = rawText.replace(/```json/gi, '').replace(/```/gi, '').trim();
-      
-      const parsed = JSON.parse(rawText);
-      return Array.isArray(parsed.deletions) ? parsed.deletions : [];
-    } catch (e) {
-      console.error("KI Batch Fehler:", e);
-      return paths.map(p => ({ path: p, status: 'keep', reason: "KI Fehler, Sicherheitshalber behalten" }));
-    }
-  };
-
-  const generateCommitMessageWithAI = async (added, modified, finalDeletions, codeDiffs) => {
-    try {
-      const prompt = `Schreibe eine kurze, professionelle Git-Commit-Nachricht auf Deutsch.
-      Neu: ${added} Dateien
-      Geändert: ${modified} Dateien
-      Gelöscht: ${finalDeletions} Dateien
-      
-      Auszüge aus den Änderungen:
-      ${codeDiffs}
-      
-      Antworte NUR mit der Commit-Nachricht.`;
-
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${getActualGeminiKey()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      });
-      const data = await response.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "System Update";
-    } catch (e) {
-      return `Update: System generierter Commit (${added} Neu, ${modified} Geändert)`;
-    }
-  };
-
-
-  const startAnalysis = async () => {
-    if (!window.JSZip) return setDialog({ message: "ZIP-Bibliothek lädt noch. Bitte kurz warten.", isAlert: true });
-    if (stagedFiles.length === 0) return;
-
-    setView('sync_flow'); setSyncStep('analysis'); setLogs([]); setDeletableFiles([]);
-    addLog(`Starte smarte Analyse für "${activeProject.name}"...`);
-    
-    try {
-      const localFiles = {}; 
-      let count = 0;
-
-      for (const file of stagedFiles) {
-        if (file.name.toLowerCase().endsWith('.zip')) {
-          const zip = await window.JSZip.loadAsync(file);
-          const entries = Object.entries(zip.files).filter(([p, e]) => !e.dir && !p.includes('__MACOSX') && !p.startsWith('.'));
-          for (const [path, zipEntry] of entries) {
-            const uint8array = await zipEntry.async("uint8array");
-            localFiles[path] = { 
-              contentBase64: await zipEntry.async("base64"), 
-              sha: await calculateGitBlobSha(uint8array),
-              isText: path.match(/\.(js|jsx|ts|tsx|html|css|py|json|md|txt)$/i)
-            };
-            count++;
-          }
-        } else {
-          const path = file.webkitRelativePath || file.name;
-          const arrayBuffer = await file.arrayBuffer();
-          const uint8array = new Uint8Array(arrayBuffer);
-          localFiles[path] = {
-            contentBase64: arrayBufferToBase64(arrayBuffer),
-            sha: await calculateGitBlobSha(uint8array),
-            isText: path.match(/\.(js|jsx|ts|tsx|html|css|py|json|md|txt)$/i)
-          };
-          count++;
-        }
-      }
-      addLog(`Lokal bereitgestellt: ${count} Datei(en).`, 'success');
-
-      addLog(`Lade Git Struktur (${activeProject.branch})...`);
-      const refData = await githubRequest(activeProject.repoStr, `/git/ref/heads/${activeProject.branch}`);
-      const baseTreeSha = (await githubRequest(activeProject.repoStr, `/git/commits/${refData.object.sha}`)).tree.sha;
-      const remoteFiles = {};
-      (await githubRequest(activeProject.repoStr, `/git/trees/${baseTreeSha}?recursive=1`)).tree.forEach(i => { if (i.type === 'blob') remoteFiles[i.path] = i; });
-
-      addLog(isFullSync ? "Führe vollständigen Diff-Abgleich durch..." : "Führe Teil-Update Abgleich durch...", 'info');
-      const added = [], modified = [], potentiallyDeleted = [];
-
-      for (const [path, data] of Object.entries(localFiles)) {
-        if (!remoteFiles[path]) added.push({ path, ...data });
-        else if (remoteFiles[path].sha !== data.sha) modified.push({ path, oldSha: remoteFiles[path].sha, ...data });
-      }
-
-      if (isFullSync) {
-        for (const path of Object.keys(remoteFiles)) {
-          if (!localFiles[path] && !PROTECTED_FILES_REGEX.test(path)) {
-            potentiallyDeleted.push({ path, sha: remoteFiles[path].sha });
-          }
+          const raw = localStorage.getItem(STORAGE_KEY);
+          return raw ? JSON.parse(raw) : initialState;
+        } catch {
+          return initialState;
         }
       }
 
-      const totalChanges = added.length + modified.length + potentiallyDeleted.length;
-      if (totalChanges === 0) {
-        addLog("Alle lokalen Dateien sind bereits exakt identisch mit GitHub. Nichts zu tun!", 'success');
-        setTimeout(() => { setStagedFiles([]); setView('project_detail'); }, 4000); 
-        return;
+      function saveState(state) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       }
 
-      addLog(`Ergebnis: +${added.length} Neu, ~${modified.length} Geändert, -${potentiallyDeleted.length} Fehlend.`);
+      function App() {
+        const [state, setState] = React.useState(loadState());
+        const [form, setForm] = React.useState({ name: "", repo: "", branch: "main" });
+        const [note, setNote] = React.useState("");
 
-      addLog("Bereite Code-Kontext für Tiefen-Prüfung vor...");
-      let codeDiffs = ""; let diffCount = 0;
-      for (const mod of modified) {
-        if (mod.isText && diffCount < 3) {
-          try {
-            const oldContent = b64DecodeUnicode((await githubRequest(activeProject.repoStr, `/git/blobs/${mod.oldSha}`)).content).substring(0, 300);
-            codeDiffs += `\nDatei: ${mod.path}\nAlt: ${oldContent}\nNeu: ${b64DecodeUnicode(mod.contentBase64).substring(0, 300)}`;
-            diffCount++;
-          } catch(e){}
-        }
-      }
-      
-      const projectContextStr = `Neue Dateien: ${added.map(f=>f.path).join(', ')}\nGeänderte Dateien: ${modified.map(f=>f.path).join(', ')}\nCode-Auszüge:\n${codeDiffs}`;
+        React.useEffect(() => saveState(state), [state]);
 
-      const smartDeletes = [];
-      if (potentiallyDeleted.length > 0) {
-        addLog(`KI prüft ${potentiallyDeleted.length} fehlende Dateien tiefgründig gegen den neuen Code...`, 'ai');
-        
-        const BATCH_SIZE = 10;
-        for (let i = 0; i < potentiallyDeleted.length; i += BATCH_SIZE) {
-          const batch = potentiallyDeleted.slice(i, i + BATCH_SIZE);
-          const batchPaths = batch.map(f => f.path);
-          const aiDecisions = await analyzeDeletionsBatchWithAI(batchPaths, projectContextStr);
-          
-          for (const file of batch) {
-            const decision = aiDecisions.find(d => d.path === file.path) || { status: 'keep', reason: 'KI Sicherheitsnetz' };
-            
-            let aiProposedDelete = false;
-            let shouldDelete = false;
+        const addProject = (e) => {
+          e.preventDefault();
+          if (!form.name || !form.repo) return;
+          const project = { id: crypto.randomUUID(), ...form, createdAt: Date.now() };
+          setState((prev) => ({ ...prev, projects: [project, ...prev.projects] }));
+          setForm({ name: "", repo: "", branch: "main" });
+        };
 
-            if (decision.status === 'delete') {
-              aiProposedDelete = true;
-              shouldDelete = true; 
-              addLog(`Sicher löschen: "${file.path}" (${decision.reason})`, 'warning');
-            } else if (decision.status === 'unsure') {
-              aiProposedDelete = true;
-              shouldDelete = false; 
-              addLog(`Vorschlag (Unsicher): "${file.path}" (${decision.reason})`, 'warning');
-            } else {
-              aiProposedDelete = false; 
-              shouldDelete = false;
-              addLog(`Sicher behalten: "${file.path}" (${decision.reason})`, 'ai');
+        const removeProject = (id) => {
+          setState((prev) => ({ ...prev, projects: prev.projects.filter((p) => p.id !== id) }));
+        };
+
+        const saveSettings = (e) => {
+          e.preventDefault();
+          const data = new FormData(e.target);
+          setState((prev) => ({
+            ...prev,
+            settings: {
+              githubToken: data.get("githubToken") || "",
+              geminiToken: data.get("geminiToken") || ""
             }
+          }));
+        };
 
-            smartDeletes.push({
-              ...file,
-              aiProposedDelete,
-              shouldDelete,
-              status: decision.status,
-              reason: decision.reason
-            });
-          }
-        }
-        const toDeleteCount = smartDeletes.filter(d=>d.shouldDelete).length;
-        const unsureCount = smartDeletes.filter(d=>d.aiProposedDelete && !d.shouldDelete).length;
-        addLog(`Fazit KI: ${toDeleteCount} sichere Löschungen, ${unsureCount} unsichere Vorschläge.`, 'ai');
-      }
+        const addHistory = () => {
+          if (!note.trim()) return;
+          setState((prev) => ({
+            ...prev,
+            history: [{ id: crypto.randomUUID(), text: note.trim(), timestamp: Date.now() }, ...prev.history]
+          }));
+          setNote("");
+        };
 
-      const commitMsg = await generateCommitMessageWithAI(added.length, modified.length, smartDeletes.filter(d=>d.shouldDelete).length, codeDiffs);
-      const computedAnalysis = { added, modified, latestCommitSha: refData.object.sha, baseTreeSha };
+        const clearAll = () => {
+          if (!confirm("Alle lokal gespeicherten Daten wirklich löschen?")) return;
+          setState(initialState);
+        };
 
-      if (activeProject.isAutoCommit) {
-        addLog("Auto-Commit aktiv. Führe Synchronisation der sicheren Änderungen aus...", 'warning');
-        await performSyncAction(computedAnalysis, commitMsg, smartDeletes);
-      } else {
-        setAiCommitMessage(commitMsg);
-        setDeletableFiles(smartDeletes);
-        setAnalysisResult(computedAnalysis);
-        setSyncStep('review');
-      }
-
-    } catch (error) { 
-      addLog(`FEHLER: ${error.message}`, 'error'); 
-    }
-  };
-
-  const toggleDelete = (path) => {
-    setDeletableFiles(prev => prev.map(f => f.path === path ? { ...f, shouldDelete: !f.shouldDelete } : f));
-  };
-
-  const performSyncAction = async (analysis, message, deletesArray) => {
-    setSyncStep('uploading'); 
-    addLog("Lade Änderungen auf GitHub hoch...");
-    try {
-      const { added, modified, latestCommitSha, baseTreeSha } = analysis;
-      const filesToUpload = [...added, ...modified];
-      const actualDeletions = deletesArray.filter(f => f.shouldDelete);
-      const newTreeItems = [];
-
-      setProgress({ current: 0, total: filesToUpload.length });
-      for (let i=0; i < filesToUpload.length; i++) {
-        const file = filesToUpload[i];
-        const blobData = await githubRequest(activeProject.repoStr, '/git/blobs', 'POST', { content: file.contentBase64, encoding: 'base64' });
-        newTreeItems.push({ path: file.path, mode: '100644', type: 'blob', sha: blobData.sha });
-        setProgress({ current: i+1, total: filesToUpload.length });
-      }
-
-      for (const file of actualDeletions) {
-        newTreeItems.push({ path: file.path, mode: '100644', type: 'blob', sha: null });
-      }
-
-      addLog("Erstelle finalen Commit...");
-      const newTreeData = await githubRequest(activeProject.repoStr, '/git/trees', 'POST', { base_tree: baseTreeSha, tree: newTreeItems });
-      const newCommitData = await githubRequest(activeProject.repoStr, '/git/commits', 'POST', { message: message, tree: newTreeData.sha, parents: [latestCommitSha] });
-      await githubRequest(activeProject.repoStr, `/git/refs/heads/${activeProject.branch}`, 'PATCH', { sha: newCommitData.sha, force: false });
-
-      addLog("Erfolgreich synchronisiert!", 'success');
-      await saveHistoryEntry(activeProject.id, message, { added: added.length, modified: modified.length, deleted: actualDeletions.length }, newCommitData.sha);
-      
-      setStagedFiles([]); 
-      setSyncStep('success');
-      setTimeout(() => {
-        setView('project_detail');
-      }, 3000);
-    } catch (error) { 
-      addLog(`SYNC FEHLER: ${error.message}`, 'error'); 
-    }
-  };
-
-  // --- UI Components ---
-  const IconGithub = ({ className }) => <svg className={className || "w-7 h-7"} fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>;
-  const IconFolder = ({ className }) => <svg className={className || "w-5 h-5 text-gray-500"} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>;
-  const IconSettings = () => <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>;
-
-  if (!user || !settingsLoaded || view === 'loading') return <div className="min-h-screen flex items-center justify-center bg-gray-50 text-gray-500">Systeme werden geladen...</div>;
-
-  return (
-    <>
-      {/* --- ALLE OVERLAYS --- */}
-      {dialog && (
-        <div className="fixed top-0 left-0 w-full h-full bg-black/40 backdrop-blur-sm z-[9999] flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white rounded-3xl p-8 max-w-sm w-full shadow-2xl relative animate-in zoom-in-95">
-            <h3 className="text-xl font-bold text-gray-900 mb-2">{dialog.isAlert ? 'Hinweis' : 'Sicher?'}</h3>
-            <p className="text-sm text-gray-600 mb-8 leading-relaxed">{dialog.message}</p>
-            <div className="flex gap-3 justify-end">
-              {!dialog.isAlert && (
-                <button onClick={() => setDialog(null)} className="px-5 py-3 rounded-2xl font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200 transition-colors">
-                  Abbrechen
-                </button>
-              )}
-              <button
-                onClick={() => {
-                  if (dialog.onConfirm) dialog.onConfirm();
-                  setDialog(null);
-                }}
-                className={`px-5 py-3 rounded-2xl font-bold text-white transition-colors ${dialog.isDestructive ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-900 hover:bg-gray-800'}`}
-              >
-                {dialog.isAlert ? 'OK' : 'Bestätigen'}
-              </button>
+        return (
+          <div className="wrap">
+            <div className="card">
+              <h1>GitHub AI Sync (Offline, statisch)</h1>
+              <p className="muted">
+                Läuft als <strong>eine statische Datei</strong> (z. B. GitHub Pages), ohne Build-Schritt und ohne Firebase.
+                Alle Daten werden lokal im Browser gespeichert (localStorage).
+              </p>
+              <span className="tag">No Build • Babel im Browser • Offline-Speicherung</span>
             </div>
-          </div>
-        </div>
-      )}
 
-      {isGlobalSettingsModalOpen && (
-        <div className="fixed top-0 left-0 w-full h-full bg-black/40 backdrop-blur-sm z-[9999] flex items-center justify-center p-4 overflow-y-auto animate-in fade-in">
-          <div className="bg-white rounded-3xl p-8 max-w-lg w-full shadow-2xl relative">
-            <h2 className="text-xl font-bold mb-2">Globale API Keys anpassen</h2>
-            <p className="text-sm text-gray-500 mb-6">Diese Tokens werden sicher gespeichert und für alle deine Projekte verwendet.</p>
-            
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-bold text-gray-700 mb-1">GitHub PAT (classic)</label>
-                <input 
-                  type="password" 
-                  defaultValue={globalSettings?.githubToken} 
-                  id="globalTokenInput"
-                  placeholder="ghp_..." 
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-gray-900 outline-none font-mono" 
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm font-bold text-gray-700 mb-1">Google AI Studio Key</label>
-                <input 
-                  type="password" 
-                  defaultValue={globalSettings?.geminiToken} 
-                  id="globalGeminiInput"
-                  placeholder="AIzaSy..." 
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-purple-600 outline-none font-mono" 
-                />
-              </div>
-              
-              {globalSettings?.githubToken && (
-                <div className={`text-sm font-medium flex items-center gap-2 ${tokenStatus === 'valid' ? 'text-green-600' : tokenStatus === 'invalid' ? 'text-red-600' : 'text-gray-500'}`}>
-                  {tokenStatus === 'loading' && <span className="animate-spin inline-block w-4 h-4 border-2 border-current border-t-transparent rounded-full" />}
-                  {tokenStatus === 'valid' && <span>✓ GitHub Token ist aktiv</span>}
-                  {tokenStatus === 'invalid' && <span>❌ GitHub Token abgelaufen</span>}
-                </div>
-              )}
-
-              <div className="pt-4 flex justify-end gap-3">
-                <button onClick={() => setIsGlobalSettingsModalOpen(false)} className="px-5 py-3 rounded-2xl font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200">Abbrechen</button>
-                <button onClick={handleSaveGlobalTokens} className="px-6 py-3 rounded-2xl font-bold text-white bg-gray-900 hover:bg-gray-800">Speichern</button>
-              </div>
-
-              <div className="mt-4 pt-4 border-t border-gray-100 text-center">
-                <button onClick={() => { setIsGlobalSettingsModalOpen(false); setView('landing'); }} className="text-sm font-medium text-gray-500 hover:text-gray-900 underline">
-                  Zurück zur Startseite (Landingpage)
-                </button>
-              </div>
+            <div className="card">
+              <h2>Globale Einstellungen (lokal)</h2>
+              <form onSubmit={saveSettings} className="grid g2">
+                <input name="githubToken" placeholder="GitHub Token" defaultValue={state.settings.githubToken} />
+                <input name="geminiToken" placeholder="Gemini Token" defaultValue={state.settings.geminiToken} />
+                <button type="submit">Einstellungen speichern</button>
+                <button type="button" className="secondary" onClick={clearAll}>Alles lokal zurücksetzen</button>
+              </form>
             </div>
-          </div>
-        </div>
-      )}
 
-      {isProjectSettingsModalOpen && activeProject && (
-        <div className="fixed top-0 left-0 w-full h-full bg-black/40 backdrop-blur-sm z-[9999] flex items-center justify-center p-4 overflow-y-auto animate-in fade-in">
-          <div className="bg-white rounded-3xl p-8 max-w-sm w-full shadow-2xl relative">
-            <h2 className="text-xl font-bold mb-6">Projekt Einstellungen</h2>
-            
-            <div className="space-y-6">
-              <div className="p-4 bg-gray-50 rounded-2xl border border-gray-200 hover:bg-gray-100 transition-colors">
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <div className="mt-0.5">
-                    <input 
-                      type="checkbox" 
-                      checked={!!activeProject.isAutoCommit} 
-                      onChange={handleToggleAutoCommit}
-                      className="w-5 h-5 accent-gray-900 rounded cursor-pointer"
-                    />
-                  </div>
-                  <div>
-                    <span className="block font-bold text-gray-900">Auto-Commit</span>
-                    <span className="block text-xs text-gray-500 mt-1">Lädt jede hochgeladene Datei sofort hoch. (Unsichere Löschungen werden geschützt).</span>
-                  </div>
-                </label>
-              </div>
+            <div className="card">
+              <h2>Projekt anlegen</h2>
+              <form onSubmit={addProject} className="grid g2">
+                <input placeholder="Projektname" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+                <input placeholder="owner/repo" value={form.repo} onChange={(e) => setForm({ ...form, repo: e.target.value })} />
+                <input placeholder="Branch" value={form.branch} onChange={(e) => setForm({ ...form, branch: e.target.value })} />
+                <button type="submit">Projekt speichern</button>
+              </form>
 
-              <div className="pt-6 border-t border-gray-100">
-                <button onClick={handleDeleteProject} className="w-full px-5 py-3 rounded-2xl font-bold text-red-600 bg-red-50 hover:bg-red-100 transition-colors">
-                  Projekt löschen
-                </button>
-              </div>
-              
-              <button onClick={() => setIsProjectSettingsModalOpen(false)} className="w-full px-5 py-3 rounded-2xl font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200">Schließen</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* --- HAUPT APP (Render Logik) --- */}
-      
-      {/* 1. Landingpage */}
-      {view === 'landing' && (
-        <div className="min-h-screen bg-white font-sans animate-in fade-in">
-          <nav className="flex justify-between items-center p-6 max-w-6xl mx-auto w-full">
-            <div className="flex items-center gap-3">
-              <div className="p-2 bg-gray-900 text-white rounded-xl"><IconGithub className="w-6 h-6"/></div>
-              <span className="font-bold text-xl text-gray-900 tracking-tight">AI Github File Sync</span>
-            </div>
-            {globalSettings?.githubToken && globalSettings?.geminiToken ? (
-               <button onClick={() => setView('dashboard')} className="font-bold text-gray-900 bg-gray-100 hover:bg-gray-200 px-5 py-2.5 rounded-full transition-colors">Zum Dashboard</button>
-            ) : (
-               <button onClick={() => setView('setup')} className="font-bold text-white bg-gray-900 hover:bg-gray-800 px-5 py-2.5 rounded-full transition-colors">Einrichten</button>
-            )}
-          </nav>
-
-          <main className="max-w-6xl mx-auto px-6 pt-24 pb-32 text-center">
-            <h1 className="text-5xl md:text-7xl font-extrabold text-gray-900 tracking-tight mb-8">
-              Smart Deployments,<br />
-              <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-purple-600">KI-gesteuert.</span>
-            </h1>
-            <p className="text-xl text-gray-500 mb-12 max-w-2xl mx-auto leading-relaxed">
-              Lade deinen exportierten Code (ZIP) hoch. Die KI vergleicht Änderungen, löscht veraltete Dateien absolut sicher und generiert perfekte Commits. Alles offline in deinem Browser.
-            </p>
-            <button 
-              onClick={() => setView(globalSettings?.githubToken && globalSettings?.geminiToken ? 'dashboard' : 'setup')} 
-              className="px-10 py-5 rounded-full bg-gray-900 text-white font-bold text-xl shadow-xl hover:bg-gray-800 hover:-translate-y-1 transition-all"
-            >
-              Jetzt starten
-            </button>
-          </main>
-
-          <section className="bg-gray-50 py-24 border-t border-gray-100">
-            <div className="max-w-6xl mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-10 text-left">
-              <div className="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
-                <div className="text-4xl mb-6">📦</div>
-                <h3 className="font-bold text-xl mb-3 text-gray-900">1-Klick Upload</h3>
-                <p className="text-gray-500 leading-relaxed">Ziehe deinen Code einfach rein. Das Tool entpackt, hasht und synchronisiert alles lokal und blitzschnell.</p>
-              </div>
-              <div className="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
-                <div className="text-4xl mb-6">🧠</div>
-                <h3 className="font-bold text-xl mb-3 text-gray-900">Sicheres KI Review</h3>
-                <p className="text-gray-500 leading-relaxed">Die KI prüft jede fehlende Datei tiefgründig auf Abhängigkeiten. Nur was 100% veraltet ist, wird sicher gelöscht.</p>
-              </div>
-              <div className="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
-                <div className="text-4xl mb-6">⚡</div>
-                <h3 className="font-bold text-xl mb-3 text-gray-900">Vollautomatisch</h3>
-                <p className="text-gray-500 leading-relaxed">Aktiviere den Auto-Commit Modus, um deine Änderungen ohne Klicks in Sekunden live auf GitHub zu bringen.</p>
-              </div>
-            </div>
-          </section>
-        </div>
-      )}
-
-      {/* 2. Setup (Onboarding) */}
-      {view === 'setup' && (
-        <div className="min-h-screen w-full bg-gray-50 flex items-center justify-center p-4 font-sans">
-          <div className="bg-white rounded-3xl p-8 md:p-12 border border-gray-200 shadow-xl max-w-2xl w-full relative transition-all duration-300">
-            
-            {setupStep === 1 && (
-              <div className="animate-in fade-in slide-in-from-right-4">
-                <div className="text-center mb-8">
-                  <div className="w-16 h-16 bg-gray-100 text-gray-900 rounded-2xl flex items-center justify-center mx-auto mb-4">
-                    <IconGithub className="w-8 h-8" />
-                  </div>
-                  <h2 className="text-2xl font-bold mb-2 text-gray-900">GitHub Access Key</h2>
-                  <p className="text-sm text-gray-500">Bitte gib deinen Personal Access Token (classic) ein, damit das Tool deinen Code hochladen kann.</p>
-                </div>
-                
-                <input 
-                  type="password" 
-                  value={tempGithubToken}
-                  onChange={(e) => setTempGithubToken(e.target.value)}
-                  placeholder="ghp_..." 
-                  className={`w-full px-4 py-4 bg-gray-50 border ${setupError ? 'border-red-300 focus:ring-red-500' : 'border-gray-200 focus:ring-gray-900'} rounded-2xl focus:ring-2 outline-none mb-2 text-center font-mono text-lg`} 
-                />
-                {setupError && <p className="text-sm text-red-500 mb-4 text-center font-medium">{setupError}</p>}
-
-                <div className="bg-blue-50 border border-blue-100 rounded-2xl p-5 mb-6 text-sm text-blue-900">
-                  <h4 className="font-bold flex items-center gap-2 mb-3"><span className="text-lg">💡</span> So erstellst du den Token:</h4>
-                  <ol className="list-decimal list-inside space-y-2 ml-1">
-                    <li>Gehe zu den <a href="https://github.com/settings/tokens" target="_blank" rel="noreferrer" className="text-blue-700 underline font-semibold">GitHub Developer Settings</a></li>
-                    <li>Klicke auf <b>Generate new token (classic)</b></li>
-                    <li>Setze einen Haken bei <b>repo</b> (Full control of private repositories)</li>
-                    <li>Kopiere den generierten Token (beginnt mit <code>ghp_</code>)</li>
-                  </ol>
-                </div>
-
-                <button onClick={handleCheckGithub} disabled={isVerifying || !tempGithubToken} className="w-full px-6 py-4 rounded-2xl font-bold text-white bg-gray-900 hover:bg-gray-800 disabled:bg-gray-400 shadow-md transition-all flex justify-center items-center gap-2 text-lg">
-                  {isVerifying ? <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span> : 'Prüfen & Weiter'}
-                </button>
-              </div>
-            )}
-
-            {setupStep === 2 && (
-              <div className="animate-in fade-in slide-in-from-right-4">
-                <div className="text-center mb-8">
-                  <div className="w-16 h-16 bg-purple-100 text-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-3xl">
-                    🤖
-                  </div>
-                  <h2 className="text-2xl font-bold mb-2 text-gray-900">Google AI Studio Key</h2>
-                  <p className="text-sm text-gray-500">Die KI ist das Herzstück. Sie generiert Commits und schützt Dateien vor versehentlicher Löschung.</p>
-                </div>
-                
-                <input 
-                  type="password" 
-                  value={tempGeminiToken}
-                  onChange={(e) => setTempGeminiToken(e.target.value)}
-                  placeholder="AIzaSy..." 
-                  className={`w-full px-4 py-4 bg-gray-50 border ${setupError ? 'border-red-300 focus:ring-red-500' : 'border-gray-200 focus:ring-purple-600'} rounded-2xl focus:ring-2 outline-none mb-2 text-center font-mono text-lg`} 
-                />
-                {setupError && <p className="text-sm text-red-500 mb-4 text-center font-medium">{setupError}</p>}
-
-                <div className="bg-purple-50 border border-purple-100 rounded-2xl p-5 mb-6 text-sm text-purple-900">
-                  <h4 className="font-bold flex items-center gap-2 mb-3"><span className="text-lg">💡</span> So erstellst du den API Key:</h4>
-                  <p className="mb-3">Du kannst einen <b>kostenlosen (Free Tier)</b> oder einen bezahlten Key nutzen. Beides funktioniert perfekt!</p>
-                  <ol className="list-decimal list-inside space-y-2 ml-1">
-                    <li>Gehe zu <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-purple-700 underline font-semibold">Google AI Studio</a></li>
-                    <li>Klicke auf <b>Create API key</b></li>
-                    <li>Wähle ein Projekt aus (oder erstelle ein neues)</li>
-                    <li>Kopiere den Key (beginnt mit <code>AIzaSy</code>)</li>
-                  </ol>
-                </div>
-
-                <button onClick={handleCheckGemini} disabled={isVerifying || !tempGeminiToken} className="w-full px-6 py-4 rounded-2xl font-bold text-white bg-purple-600 hover:bg-purple-700 disabled:bg-purple-300 shadow-md transition-all flex justify-center items-center gap-2 text-lg">
-                  {isVerifying ? <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span> : 'Einrichtung abschließen'}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* 3. App Core (Dashboard, Projekte, Sync) */}
-      {(view === 'dashboard' || view === 'new_project' || view === 'project_detail' || view === 'sync_flow') && (
-        <div className="max-w-4xl mx-auto space-y-6 relative z-10 pt-4 md:pt-8">
-          
-          {/* Header (App) */}
-          <div className="flex items-center justify-between mb-8">
-            <div className="flex items-center gap-4 cursor-pointer" onClick={() => setView('dashboard')}>
-              <div className="p-3 bg-gray-900 text-white rounded-2xl shadow-md"><IconGithub /></div>
-              <div>
-                <h1 className="text-2xl font-bold tracking-tight">AI Github File Sync</h1>
-                <p className="text-sm text-gray-500 font-medium">Smart Deployments</p>
-              </div>
-            </div>
-            
-            <div className="flex items-center gap-3">
-              {view !== 'dashboard' && (
-                <button onClick={() => setView('dashboard')} className="text-sm font-medium text-gray-500 hover:text-gray-900 bg-white px-4 py-2 rounded-xl border border-gray-200 shadow-sm transition-colors hidden sm:block">
-                  Zurück zur Übersicht
-                </button>
-              )}
-              <button onClick={() => setIsGlobalSettingsModalOpen(true)} className="p-3 bg-white border border-gray-200 rounded-xl text-gray-600 hover:text-gray-900 shadow-sm hover:shadow-md transition-all">
-                <IconSettings />
-              </button>
-            </div>
-          </div>
-
-          {view === 'dashboard' && (
-            <div className="space-y-6 animate-in fade-in duration-300">
-              <div className="flex items-center justify-between">
-                <h2 className="text-lg font-bold">Deine Projekte</h2>
-                <button onClick={() => setView('new_project')} className="bg-gray-900 hover:bg-gray-800 text-white text-sm font-semibold py-2.5 px-5 rounded-xl shadow-md transition-colors flex items-center gap-2">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"></path></svg>
-                  Neues Projekt
-                </button>
-              </div>
-
-              {projects.length === 0 ? (
-                <div className="text-center py-24 bg-white rounded-3xl border border-gray-200 shadow-sm flex flex-col items-center justify-center">
-                  <IconFolder className="w-24 h-24 text-gray-200 mb-6" />
-                  <h3 className="text-gray-600 font-bold text-xl">Noch keine Projekte vorhanden.</h3>
-                  <p className="text-gray-400 mt-2">Erstelle ein neues Projekt, um deinen Code zu synchronisieren.</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {projects.map(p => (
-                    <div key={p.id} onClick={() => { setActiveProject(p); setView('project_detail'); }} className="bg-white p-5 rounded-3xl border border-gray-200 shadow-sm hover:shadow-md hover:border-gray-300 cursor-pointer transition-all group">
-                      <div className="flex justify-between items-start mb-3">
-                        <div className="flex items-center gap-3">
-                          <div className="p-2 bg-gray-50 rounded-xl group-hover:bg-gray-100 transition-colors"><IconFolder className="w-5 h-5 text-gray-500" /></div>
-                          <h3 className="font-bold text-lg">{p.name}</h3>
-                        </div>
-                        {p.isAutoCommit && <span className="text-[10px] font-bold bg-green-100 text-green-700 px-2 py-1 rounded-full uppercase">Auto</span>}
-                      </div>
-                      <div className="text-sm text-gray-500 space-y-1">
-                        <p>Repo: <span className="font-mono text-gray-800">{p.repoStr}</span></p>
-                        <p>Branch: <span className="font-mono text-gray-800 bg-gray-100 px-1.5 py-0.5 rounded">{p.branch}</span></p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-
-          {view === 'new_project' && (
-            <div className="bg-white rounded-3xl p-6 md:p-8 border border-gray-200 shadow-sm animate-in slide-in-from-bottom-4 duration-300">
-              <h2 className="text-xl font-bold mb-6">Neues Projekt anlegen</h2>
-              <div className="space-y-5">
-                <div>
-                  <label className="block text-sm font-bold text-gray-700 mb-1">Projekt Name</label>
-                  <input type="text" value={newProjectForm.name} onChange={e => setNewProjectForm({...newProjectForm, name: e.target.value})} placeholder="z.B. Mein FlutterFlow App" className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-gray-900 outline-none transition-all" />
-                </div>
-                
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-1">Repository auswählen</label>
-                    <select 
-                      value={newProjectForm.repoStr} 
-                      onChange={e => setNewProjectForm({...newProjectForm, repoStr: e.target.value})} 
-                      className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-gray-900 outline-none disabled:opacity-50"
-                      disabled={availableRepos.length === 0}
-                    >
-                      <option value="">{isLoadingRepos ? 'Lade...' : 'Wähle ein Repository...'}</option>
-                      {availableRepos.map(repo => <option key={repo} value={repo}>{repo}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-1">Branch</label>
-                    <select 
-                      value={newProjectForm.branch} 
-                      onChange={e => setNewProjectForm({...newProjectForm, branch: e.target.value})} 
-                      className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-gray-900 outline-none disabled:opacity-50"
-                      disabled={availableBranches.length === 0}
-                    >
-                      <option value="">{isLoadingBranches ? 'Lade...' : 'Wähle Branch...'}</option>
-                      {availableBranches.map(branch => <option key={branch} value={branch}>{branch}</option>)}
-                    </select>
-                  </div>
-                </div>
-                <div className="pt-4 flex justify-end gap-3">
-                  <button onClick={() => setView('dashboard')} className="px-5 py-3 rounded-2xl font-semibold text-gray-600 bg-gray-100 hover:bg-gray-200">Abbrechen</button>
-                  <button onClick={handleCreateProject} disabled={!newProjectForm.name || !newProjectForm.repoStr || !newProjectForm.branch || isSavingProject} className="px-6 py-3 rounded-2xl font-bold text-white bg-gray-900 hover:bg-gray-800 disabled:bg-gray-300 flex items-center gap-2">
-                    {isSavingProject && <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>}
-                    Projekt speichern
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {view === 'project_detail' && activeProject && (
-            <div className="space-y-6 animate-in fade-in duration-300">
-              <div className="bg-white rounded-3xl p-6 border border-gray-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                <div>
-                  <h2 className="text-xl font-bold flex items-center gap-3">
-                    {activeProject.name}
-                    {activeProject.isAutoCommit && <span className="text-xs font-bold bg-green-100 text-green-700 px-2 py-1 rounded-full uppercase tracking-wider">Auto-Commit ON</span>}
-                  </h2>
-                  <p className="text-sm text-gray-500 font-mono mt-1">{activeProject.repoStr} • Branch: {activeProject.branch}</p>
-                </div>
-                <button onClick={() => setIsProjectSettingsModalOpen(true)} className="text-gray-500 hover:bg-gray-100 border border-gray-200 px-4 py-2 rounded-xl text-sm font-bold transition-colors shadow-sm">
-                  Einstellungen
-                </button>
-              </div>
-
-              <div className="bg-white rounded-3xl p-6 border border-gray-200 shadow-sm space-y-4">
-                <div className={`border-2 border-dashed ${stagedFiles.length > 0 ? 'border-gray-200 bg-gray-50/50' : 'border-gray-300 hover:border-gray-900 hover:bg-gray-50'} rounded-2xl p-8 transition-colors relative group`}>
-                  <input type="file" multiple onChange={handleFileSelect} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
-                  <div className="flex flex-col items-center pointer-events-none text-center">
-                    <div className="p-3 bg-gray-100 text-gray-800 rounded-full mb-3 group-hover:scale-110 transition-transform">
-                      <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-                    </div>
-                    <h3 className="text-base font-bold text-gray-900">ZIP(s) & Einzelne Dateien hinzufügen</h3>
-                    <p className="text-gray-500 mt-1 text-sm">Ziehe hier beliebig viele Dateien rein.</p>
-                  </div>
-                </div>
-
-                {stagedFiles.length > 0 && (
-                  <div className="pt-2 animate-in fade-in">
-                    <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">Ausgewählte Dateien ({stagedFiles.length})</h3>
-                    <div className="space-y-2 max-h-48 overflow-y-auto pr-2">
-                      {stagedFiles.map((file, idx) => (
-                        <div key={idx} className="flex items-center justify-between bg-gray-50 border border-gray-200 px-3 py-2 rounded-xl">
-                          <div className="flex items-center gap-2 overflow-hidden">
-                            {file.name.endsWith('.zip') ? '📦' : '📄'}
-                            <span className="text-sm font-mono text-gray-700 truncate">{file.name}</span>
-                          </div>
-                          <button onClick={() => removeStagedFile(idx)} className="text-gray-400 hover:text-red-500 hover:bg-red-50 p-1.5 rounded-lg transition-colors">
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-xl flex items-center justify-between cursor-pointer hover:bg-gray-100 transition-colors" onClick={() => setIsFullSync(!isFullSync)}>
+              <ul style={{ marginTop: 12 }}>
+                {state.projects.map((p) => (
+                  <li key={p.id}>
+                    <div className="row">
                       <div>
-                        <span className="block text-sm font-bold text-gray-900">Vollständiger Sync (inkl. Löschen)</span>
-                        <span className="block text-xs text-gray-500">Fehlende Dateien werden analysiert und ggf. gelöscht.</span>
+                        <strong>{p.name}</strong>
+                        <div className="small muted">{p.repo} • {p.branch}</div>
                       </div>
-                      <div className="mt-0.5">
-                         <input 
-                           type="checkbox" 
-                           checked={isFullSync} 
-                           onChange={(e) => { e.stopPropagation(); setIsFullSync(e.target.checked); }} 
-                           className="w-5 h-5 accent-gray-900 rounded cursor-pointer" 
-                         />
-                      </div>
+                      <button className="danger" onClick={() => removeProject(p.id)}>Löschen</button>
                     </div>
-
-                    <div className="mt-4 flex gap-3">
-                      <button onClick={() => { setStagedFiles([]); setIsFullSync(false); }} className="px-4 py-3 rounded-xl font-bold text-gray-600 bg-gray-100 hover:bg-gray-200">
-                        Alle entfernen
-                      </button>
-                      <button onClick={startAnalysis} className="flex-1 bg-gray-900 hover:bg-gray-800 text-white font-bold py-3 px-4 rounded-xl shadow-md flex justify-center items-center gap-2">
-                        {activeProject.isAutoCommit ? 'Jetzt live hochladen (Auto)' : 'Analyse starten'}
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 5l7 7-7 7M5 5l7 7-7 7"></path></svg>
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div>
-                <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider mb-4 flex items-center gap-2">
-                  <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> 
-                  Letzte Commits
-                </h3>
-                <div className="space-y-3">
-                  {history.filter(h => h.projectId === activeProject.id).length === 0 ? (
-                    <p className="text-sm text-gray-400 italic">Noch keine Uploads für dieses Projekt.</p>
-                  ) : (
-                    history.filter(h => h.projectId === activeProject.id).map(entry => (
-                      <div key={entry.id} className="bg-white p-4 rounded-2xl border border-gray-200 flex justify-between items-center shadow-sm">
-                        <div>
-                          <p className="font-bold text-gray-800 text-sm">{entry.message}</p>
-                          <p className="text-xs text-gray-500 mt-1">
-                            {new Date(entry.timestamp).toLocaleString()} • 
-                            <span className="text-green-600 ml-2">+{entry.stats?.added||0}</span> 
-                            <span className="text-yellow-600 ml-2">~{entry.stats?.modified||0}</span> 
-                            <span className="text-red-600 ml-2">-{entry.stats?.deleted||0}</span>
-                          </p>
-                        </div>
-                        <a href={`https://github.com/${activeProject.repoStr}/commit/${entry.commitSha}`} target="_blank" rel="noreferrer" className="text-xs font-mono bg-gray-100 hover:bg-gray-200 px-2 py-1 rounded text-gray-600 transition-colors">
-                          {entry.commitSha?.substring(0,7)}
-                        </a>
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
+                  </li>
+                ))}
+                {state.projects.length === 0 && <li className="muted">Noch keine Projekte gespeichert.</li>}
+              </ul>
             </div>
-          )}
 
-          {view === 'sync_flow' && (
-            <div className="bg-white rounded-3xl p-6 md:p-8 border border-gray-200 shadow-sm animate-in zoom-in-95 duration-300">
-              
-              {syncStep === 'success' ? (
-                <div className="flex flex-col items-center justify-center py-12 animate-in zoom-in duration-500">
-                  <div className="w-24 h-24 bg-green-100 rounded-full flex items-center justify-center mb-6 relative">
-                    <div className="absolute inset-0 bg-green-200 rounded-full animate-ping opacity-50"></div>
-                    <svg className="w-12 h-12 text-green-600 z-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path>
-                    </svg>
-                  </div>
-                  <h2 className="text-2xl font-bold text-gray-900">Auf GitHub hochgeladen!</h2>
-                  <p className="text-gray-500 mt-2">Dein Code ist jetzt live.</p>
-                </div>
-              ) : (
-                <>
-                  <div className="flex gap-2 mb-8">
-                    {['analysis', 'review', 'uploading'].map((step, idx) => {
-                      const isActive = syncStep === step;
-                      const isPast = ['analysis', 'review', 'uploading'].indexOf(syncStep) > idx;
-                      if (activeProject?.isAutoCommit && step === 'review') return null; 
-                      return (
-                        <div key={step} className={`h-2 flex-1 rounded-full ${isActive ? 'bg-gray-900' : isPast ? 'bg-gray-300' : 'bg-gray-100'}`} />
-                      )
-                    })}
-                  </div>
-
-                  {(syncStep === 'analysis' || syncStep === 'uploading') && (
-                    <div className="space-y-4">
-                      <h3 className="text-lg font-bold flex items-center gap-3">
-                        <div className="w-4 h-4 border-2 border-gray-900 border-t-transparent rounded-full animate-spin"></div>
-                        {syncStep === 'analysis' ? 'Code wird analysiert...' : 'Wird auf GitHub hochgeladen...'}
-                      </h3>
-                      
-                      {progress.total > 0 && (
-                        <div className="w-full bg-gray-100 rounded-full h-2 overflow-hidden">
-                          <div className="bg-gray-900 h-2 transition-all duration-300" style={{ width: `${(progress.current / progress.total) * 100}%` }}></div>
-                        </div>
-                      )}
-
-                      <div className="bg-gray-900 rounded-2xl p-4 h-64 overflow-y-auto font-mono text-xs text-gray-300 shadow-inner">
-                        {logs.map((log, i) => (
-                          <div key={i} className={`mb-2 leading-relaxed ${log.type === 'error' ? 'text-red-400' : log.type === 'success' ? 'text-green-400' : log.type === 'warning' ? 'text-yellow-400' : log.type === 'ai' ? 'text-purple-400 font-semibold' : 'text-gray-400'}`}>
-                            <span className="text-gray-600 mr-2">[{log.time}]</span>
-                            {log.type === 'ai' && <span className="mr-1">🤖</span>}
-                            {log.msg}
-                          </div>
-                        ))}
-                        <div ref={logsEndRef} />
-                      </div>
-                    </div>
-                  )}
-
-                  {syncStep === 'review' && analysisResult && (
-                    <div className="space-y-6">
-                      <h3 className="text-xl font-bold text-gray-900">Erkannte Code-Änderungen</h3>
-                      <div className="flex flex-wrap gap-2">
-                        <span className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-bold border border-green-200">+{analysisResult.added.length} Hinzugefügt</span>
-                        <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-xs font-bold border border-yellow-200">~{analysisResult.modified.length} Geändert</span>
-                      </div>
-
-                      <div>
-                        <label className="block text-sm font-bold text-gray-700 mb-2">KI-generierte Commit-Nachricht</label>
-                        <textarea 
-                          value={aiCommitMessage}
-                          onChange={e => setAiCommitMessage(e.target.value)}
-                          className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-2xl focus:ring-2 focus:ring-gray-900 outline-none min-h-[100px] font-mono text-sm"
-                        />
-                      </div>
-
-                      {deletableFiles.filter(f => f.aiProposedDelete).length > 0 && (
-                        <div>
-                          <h3 className="font-bold text-gray-900 mb-2 flex items-center justify-between">
-                            <span>KI-Löschvorschläge ({deletableFiles.filter(f => f.aiProposedDelete && f.shouldDelete).length} sicher / {deletableFiles.filter(f => f.aiProposedDelete && !f.shouldDelete).length} unsicher)</span>
-                          </h3>
-                          <div className="bg-gray-50 border border-gray-200 rounded-2xl p-2 max-h-64 overflow-y-auto">
-                            {deletableFiles.filter(f => f.aiProposedDelete).map((file, idx) => (
-                              <label key={idx} className={`flex items-start gap-3 p-3 rounded-xl cursor-pointer transition-colors ${file.shouldDelete ? 'bg-red-50/50 hover:bg-red-50' : 'bg-white hover:bg-gray-50 mb-1 border border-gray-100'}`}>
-                                <div className="mt-0.5 relative flex items-center justify-center">
-                                  <input 
-                                    type="checkbox" 
-                                    checked={file.shouldDelete} 
-                                    onChange={() => toggleDelete(file.path)}
-                                    className="appearance-none w-5 h-5 border-2 border-gray-400 rounded bg-white checked:bg-gray-900 checked:border-gray-900 transition-colors cursor-pointer"
-                                  />
-                                  {file.shouldDelete && <svg className="absolute w-3.5 h-3.5 text-white pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M5 13l4 4L19 7"></path></svg>}
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                  <div className="flex items-center gap-2 mb-0.5">
-                                    <p className={`text-sm truncate font-mono ${file.shouldDelete ? 'text-red-700 line-through decoration-red-300' : 'text-gray-700'}`}>{file.path}</p>
-                                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${file.status === 'delete' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'}`}>
-                                      {file.status === 'delete' ? 'Sicher obsolet' : 'Vermutlich obsolet'}
-                                    </span>
-                                  </div>
-                                  <p className="text-xs text-gray-500 italic leading-snug">{file.reason}</p>
-                                </div>
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-
-                      <div className="flex gap-3 pt-2">
-                        <button onClick={() => setView('project_detail')} className="px-6 py-4 rounded-2xl font-bold text-gray-600 bg-gray-100 hover:bg-gray-200">Abbrechen</button>
-                        <button onClick={() => performSyncAction(analysisResult, aiCommitMessage, deletableFiles)} className="flex-1 bg-gray-900 hover:bg-gray-800 text-white font-bold py-4 px-4 rounded-2xl shadow-lg flex items-center justify-center gap-2">
-                          Jetzt synchronisieren
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </>
-              )}
+            <div className="card">
+              <h2>Offline-Verlauf</h2>
+              <div className="row">
+                <textarea rows="2" placeholder="Kurze Notiz / Commit-Idee" value={note} onChange={(e) => setNote(e.target.value)} />
+                <button onClick={addHistory}>Hinzufügen</button>
+              </div>
+              <ul style={{ marginTop: 12 }}>
+                {state.history.map((h) => (
+                  <li key={h.id}>
+                    <div>{h.text}</div>
+                    <div className="small muted">{new Date(h.timestamp).toLocaleString("de-DE")}</div>
+                  </li>
+                ))}
+                {state.history.length === 0 && <li className="muted">Noch kein Verlauf vorhanden.</li>}
+              </ul>
             </div>
-          )}
-        </div>
-      )}
-    </>
-  );
-}
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<App />);
+    </script>
+  </body>
+</html>
